@@ -71,7 +71,7 @@ class UNet(nn.Module):
         self.unpool1 = UnPooling2d(pool=2, type='nearest')
 
         self.dec1_2 = DECNR2d(2 * 1 * self.nch_ker, 1 * self.nch_ker, kernel_size=3, stride=1, norm=self.norm, relu=0.0, drop=[])
-        self.dec1_1 = DECNR2d(1 * self.nch_ker,     1 * self.nch_out, kernel_size=3, stride=1, norm=[],        relu=[],  drop=[], bias=False)
+        self.dec1_1 = DECNR2d(1 * self.nch_ker,     1 * self.nch_out, kernel_size=3, stride=1, norm=[],        relu=[],  drop=[], bias=True)
 
     def forward(self, x):
 
@@ -251,7 +251,8 @@ def init_net(net, init_type='normal', init_gain=0.02, gpu_ids=[]):
     if gpu_ids:
         assert(torch.cuda.is_available())
         net.to(gpu_ids[0])
-        net = torch.nn.DataParallel(net, gpu_ids)  # multi-GPUs
+        if len(gpu_ids) > 1:
+            net = torch.nn.DataParallel(net, gpu_ids)  # multi-GPUs
     init_weights(net, init_type, init_gain=init_gain)
     return net
 

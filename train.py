@@ -7,6 +7,39 @@ import torch.nn as nn
 from torchvision import transforms
 from torch.utils.tensorboard import SummaryWriter
 import matplotlib.pyplot as plt
+import csv
+import time
+import torch.nn.functional as F
+from PIL import Image
+from skimage.metrics import peak_signal_noise_ratio, structural_similarity
+
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+
+
+def infer_full_image(net, x):
+    _, _, h, w = x.shape
+    pad_h = (16 - h % 16) % 16
+    pad_w = (16 - w % 16) % 16
+    if pad_h > 0 or pad_w > 0:
+        x_pad = F.pad(x, (0, pad_w, 0, pad_h), mode='reflect')
+    else:
+        x_pad = x
+    out = net(x_pad)
+    return out[:, :, :h, :w]
+
+
+def save_preview_png(noisy_np, pred_np, gt_np, wb, save_path):
+    img_noisy = raw4_to_srgb(noisy_np, wb)
+    img_pred = raw4_to_srgb(pred_np, wb)
+    img_gt = raw4_to_srgb(gt_np, wb)
+    combined = np.concatenate([img_noisy, img_pred, img_gt], axis=1)
+    pil_img = Image.fromarray(combined)
+    w, h = pil_img.size
+    pil_img = pil_img.resize((w // 2, h // 2), Image.Resampling.BILINEAR)
+    pil_img.save(save_path)
 
 ##
 class Train:
@@ -51,6 +84,12 @@ class Train:
         self.num_freq_disp = args.num_freq_disp
         self.num_freq_save = args.num_freq_save
 
+        self.dir_list = args.dir_list
+        self.network = args.network
+        self.max_train_images = args.max_train_images
+        self.val_max_images = args.val_max_images
+        self.num_workers = args.num_workers
+
         self.gpu_ids = args.gpu_ids
 
         if self.gpu_ids and torch.cuda.is_available():
@@ -58,369 +97,336 @@ class Train:
             torch.cuda.set_device(self.gpu_ids[0])
         else:
             self.device = torch.device("cpu")
+            self.gpu_ids = []
 
-    def save(self, dir_chck, netG, optimG, epoch):
+    def save(self, dir_chck, netG, optimG, epoch, best_psnr=-1.0, is_best=False):
         if not os.path.exists(dir_chck):
             os.makedirs(dir_chck)
 
-        torch.save({'netG': netG.state_dict(),
-                    'optimG': optimG.state_dict()},
-                   '%s/model_epoch%04d.pth' % (dir_chck, epoch))
+        state = {
+            'netG': netG.state_dict(),
+            'optimG': optimG.state_dict(),
+            'epoch': epoch,
+            'best_psnr': best_psnr
+        }
+        torch.save(state, '%s/model_epoch%04d.pth' % (dir_chck, epoch))
+        torch.save(state, '%s/model_latest.pth' % dir_chck)
+        if is_best:
+            torch.save(state, '%s/model_best.pth' % dir_chck)
 
-    def load(self, dir_chck, netG, optimG=[], epoch=[], mode='train'):
-
+    def load(self, dir_chck, netG, optimG=None, epoch=None, mode='train'):
         if not os.path.exists(dir_chck) or not os.listdir(dir_chck):
-            epoch = 0
             if mode == 'train':
-                return netG, optimG, epoch
-            elif mode == 'test':
-                return netG, epoch
+                return netG, optimG, 0, -1.0
+            return netG, 0
 
-        if not epoch:
-            ckpt = os.listdir(dir_chck)
-            ckpt.sort()
-            epoch = int(ckpt[-1].split('epoch')[1].split('.pth')[0])
+        if mode == 'test' and not epoch and os.path.exists(os.path.join(dir_chck, 'model_best.pth')):
+            ckpt_path = os.path.join(dir_chck, 'model_best.pth')
+        elif not epoch and os.path.exists(os.path.join(dir_chck, 'model_latest.pth')):
+            ckpt_path = os.path.join(dir_chck, 'model_latest.pth')
+        else:
+            if not epoch:
+                ckpt = [f for f in os.listdir(dir_chck) if f.startswith('model_epoch') and f.endswith('.pth')]
+                if not ckpt:
+                    if mode == 'train':
+                        return netG, optimG, 0, -1.0
+                    return netG, 0
+                ckpt.sort()
+                epoch = int(ckpt[-1].split('epoch')[1].split('.pth')[0])
+            ckpt_path = '%s/model_epoch%04d.pth' % (dir_chck, epoch)
 
-        dict_net = torch.load('%s/model_epoch%04d.pth' % (dir_chck, epoch))
+        dict_net = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+        loaded_epoch = dict_net.get('epoch', epoch if epoch else 0)
+        best_psnr = dict_net.get('best_psnr', -1.0)
 
-        print('Loaded %dth network' % epoch)
+        print('Loaded checkpoint: %s (epoch %d)' % (ckpt_path, loaded_epoch))
 
+        netG.load_state_dict(dict_net['netG'])
         if mode == 'train':
-            netG.load_state_dict(dict_net['netG'])
-            optimG.load_state_dict(dict_net['optimG'])
-
-            return netG, optimG, epoch
-
-        elif mode == 'test':
-            netG.load_state_dict(dict_net['netG'])
-
-            return netG, epoch
+            if optimG is not None and 'optimG' in dict_net:
+                optimG.load_state_dict(dict_net['optimG'])
+            return netG, optimG, loaded_epoch, best_psnr
+        return netG, loaded_epoch
 
     def train(self):
         mode = self.mode
-
         train_continue = self.train_continue
         num_epoch = self.num_epoch
-
         lr_G = self.lr_G
-
         batch_size = self.batch_size
         device = self.device
-
         gpu_ids = self.gpu_ids
 
         nch_in = self.nch_in
         nch_out = self.nch_out
         nch_ker = self.nch_ker
-
-        size_data = (self.ny_in, self.nx_in, self.nch_in)
         size_window = (5, 5)
 
         norm = self.norm
         name_data = self.name_data
-
         num_freq_disp = self.num_freq_disp
         num_freq_save = self.num_freq_save
 
-        ## setup dataset
+        ## setup directories
         dir_chck = os.path.join(self.dir_checkpoint, self.scope, name_data)
-
-        dir_data_train = os.path.join(self.dir_data, name_data, 'train')
-        dir_data_val = os.path.join(self.dir_data, name_data, 'val')
-
         dir_log_train = os.path.join(self.dir_log, self.scope, name_data, 'train')
         dir_log_val = os.path.join(self.dir_log, self.scope, name_data, 'val')
-
-        dir_result_train = os.path.join(self.dir_result, self.scope, name_data, 'train')
         dir_result_val = os.path.join(self.dir_result, self.scope, name_data, 'val')
-        if not os.path.exists(os.path.join(dir_result_train, 'images')):
-            os.makedirs(os.path.join(dir_result_train, 'images'))
-        if not os.path.exists(os.path.join(dir_result_val, 'images')):
-            os.makedirs(os.path.join(dir_result_val, 'images'))
+        preview_dir = os.path.join(dir_result_val, 'previews')
 
-        transform_train = transforms.Compose([Normalize(mean=0.5, std=0.5), RandomFlip(), RandomCrop((self.ny_load, self.nx_load)), ToTensor()])
-        transform_val = transforms.Compose([Normalize(mean=0.5, std=0.5), RandomFlip(), RandomCrop((self.ny_load, self.nx_load)), ToTensor()])
+        os.makedirs(dir_chck, exist_ok=True)
+        os.makedirs(preview_dir, exist_ok=True)
 
-        transform_inv = transforms.Compose([ToNumpy(), Denormalize(mean=0.5, std=0.5)])
+        ## setup dataset RAW Sony SID
+        train_list = os.path.join(self.dir_list, 'Sony_train_list.txt')
+        val_list = os.path.join(self.dir_list, 'Sony_val_list.txt')
 
-        dataset_train = Dataset(dir_data_train, data_type=self.data_type, transform=transform_train, sgm=25, ratio=0.9, size_data=size_data, size_window=size_window)
-        dataset_val = Dataset(dir_data_val, data_type=self.data_type, transform=transform_val, sgm=25, ratio=0.9, size_data=size_data, size_window=size_window)
+        transform_train = transforms.Compose([RandomFlip(), ToTensor()])
+        transform_val = transforms.Compose([ToTensor()])
 
-        loader_train = torch.utils.data.DataLoader(dataset_train, batch_size=batch_size, shuffle=True, num_workers=8)
-        loader_val = torch.utils.data.DataLoader(dataset_val, batch_size=batch_size, shuffle=True, num_workers=8)
+        dataset_train = Dataset(
+            self.dir_data, train_list, mode='train', transform=transform_train,
+            patch_size=self.ny_load, max_images=self.max_train_images,
+            ratio=0.985, size_window=size_window
+        )
+        dataset_val = Dataset(
+            self.dir_data, val_list, mode='val', transform=transform_val,
+            max_images=self.val_max_images
+        )
 
-        num_train = len(dataset_train)
-        num_val = len(dataset_val)
+        loader_train = torch.utils.data.DataLoader(
+            dataset_train, batch_size=batch_size, shuffle=True,
+            num_workers=self.num_workers, pin_memory=(device.type == 'cuda'),
+            worker_init_fn=seed_worker
+        )
+        loader_val = torch.utils.data.DataLoader(
+            dataset_val, batch_size=1, shuffle=False, num_workers=self.num_workers
+        )
 
-        num_batch_train = int((num_train / batch_size) + ((num_train % batch_size) != 0))
-        num_batch_val = int((num_val / batch_size) + ((num_val % batch_size) != 0))
-
-        if nch_out == 1:
-            cmap = 'gray'
-        else:
-            cmap = None
+        num_batch_train = len(loader_train)
+        print(f'Device: {device} | Network: {self.network} | Train: {len(dataset_train)} | Val: {len(dataset_val)}')
 
         ## setup network
-        # netG = UNet(nch_in, nch_out, nch_ker, norm)
-        netG = ResNet(nch_in, nch_out, nch_ker, norm)
+        if self.network == 'resnet':
+            netG = ResNet(nch_in, nch_out, nch_ker, norm)
+        else:
+            netG = UNet(nch_in, nch_out, nch_ker, norm)
 
-        init_net(netG, init_type='normal', init_gain=0.02, gpu_ids=gpu_ids)
+        netG = init_net(netG, init_type='normal', init_gain=0.02, gpu_ids=gpu_ids)
+        netG.to(device)
 
-        ## setup loss & optimization
-        fn_REG = nn.L1Loss().to(device)  # Regression loss: L1
-        # fn_REG = nn.MSELoss().to(device)     # Regression loss: L2
-
-        paramsG = netG.parameters()
-
-        optimG = torch.optim.Adam(paramsG, lr=lr_G, betas=(self.beta1, 0.999))
+        ## setup optimization & mixed precision
+        optimG = torch.optim.Adam(netG.parameters(), lr=lr_G, betas=(self.beta1, 0.999))
+        scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda'))
 
         ## load from checkpoints
         st_epoch = 0
-
+        best_psnr = -1.0
         if train_continue == 'on':
-            netG, optimG, st_epoch = self.load(dir_chck, netG, optimG, mode=mode)
+            netG, optimG, st_epoch, best_psnr = self.load(dir_chck, netG, optimG, mode=mode)
 
-        ## setup tensorboard
+        ## setup tensorboard & csv log
         writer_train = SummaryWriter(log_dir=dir_log_train)
         writer_val = SummaryWriter(log_dir=dir_log_val)
 
+        csv_path = os.path.join(self.dir_result, self.scope, name_data, 'metrics_log.csv')
+        if not os.path.exists(csv_path):
+            with open(csv_path, 'w', newline='') as f:
+                csv.writer(f).writerow([
+                    'epoch', 'train_loss', 'val_psnr', 'val_ssim',
+                    'noisy_psnr', 'noisy_ssim', 'sec'
+                ])
+
         for epoch in range(st_epoch + 1, num_epoch + 1):
+            t0 = time.time()
+
             ## training phase
             netG.train()
-
             loss_G_train = []
 
             for batch, data in enumerate(loader_train, 1):
-                def should(freq):
-                    return freq > 0 and (batch % freq == 0 or batch == num_batch_train)
+                label = data['label'].to(device, non_blocking=True)
+                inp = data['input'].to(device, non_blocking=True)
+                mask = data['mask'].to(device, non_blocking=True)
 
-                label = data['label'].to(device)
-                input = data['input'].to(device)
-                mask = data['mask'].to(device)
+                optimG.zero_grad(set_to_none=True)
 
-                # forward netG
-                output = netG(input)
+                with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
+                    output = netG(inp)
+                    blind = 1.0 - mask
+                    loss_G = (((output - label) ** 2) * blind).sum() / (blind.sum() + 1e-8)
 
-                # backward netG
-                optimG.zero_grad()
+                scaler.scale(loss_G).backward()
+                scaler.step(optimG)
+                scaler.update()
 
-                loss_G = fn_REG(output * (1 - mask), label * (1 - mask))
+                loss_G_train.append(loss_G.item())
 
-                loss_G.backward()
-                optimG.step()
+                if batch % 20 == 0 or batch == num_batch_train:
+                    print('TRAIN: EPOCH %04d/%04d: BATCH %04d/%04d: LOSS: %.6f'
+                          % (epoch, num_epoch, batch, num_batch_train, np.mean(loss_G_train)))
 
-                # get losses
-                loss_G_train += [loss_G.item()]
-
-                print('TRAIN: EPOCH %d: BATCH %04d/%04d: LOSS: %.4f'
-                      % (epoch, batch, num_batch_train, np.mean(loss_G_train)))
-
-                if should(num_freq_disp):
-                    ## show output
-                    input = transform_inv(input)
-                    label = transform_inv(label)
-                    output = transform_inv(output)
-
-                    input = np.clip(input, 0, 1)
-                    label = np.clip(label, 0, 1)
-                    output = np.clip(output, 0, 1)
-                    dif = np.clip(abs(label - input), 0, 1)
-
-                    writer_train.add_images('input', input, num_batch_train * (epoch - 1) + batch, dataformats='NHWC')
-                    writer_train.add_images('output', output, num_batch_train * (epoch - 1) + batch, dataformats='NHWC')
-                    writer_train.add_images('label', label, num_batch_train * (epoch - 1) + batch, dataformats='NHWC')
-
-                    for j in range(label.shape[0]):
-                        # name = num_train * (epoch - 1) + num_batch_train * (batch - 1) + j
-                        name = num_batch_train * (batch - 1) + j
-                        fileset = {'name': name,
-                                   'input': "%04d-input.png" % name,
-                                   'output': "%04d-output.png" % name,
-                                   'label': "%04d-label.png" % name,
-                                   'dif': "%04d-dif.png" % name}
-
-                        plt.imsave(os.path.join(dir_result_train, 'images', fileset['input']), input[j, :, :, :].squeeze(), cmap=cmap)
-                        plt.imsave(os.path.join(dir_result_train, 'images', fileset['output']), output[j, :, :, :].squeeze(), cmap=cmap)
-                        plt.imsave(os.path.join(dir_result_train, 'images', fileset['label']), label[j, :, :, :].squeeze(), cmap=cmap)
-                        plt.imsave(os.path.join(dir_result_train, 'images', fileset['dif']), dif[j, :, :, :].squeeze(), cmap=cmap)
-
-                        append_index(dir_result_train, fileset)
-
-            writer_train.add_scalar('loss_G', np.mean(loss_G_train), epoch)
+            avg_train_loss = float(np.mean(loss_G_train))
+            writer_train.add_scalar('loss_G', avg_train_loss, epoch)
 
             ## validation phase
-            with torch.no_grad():
+            val_psnr_str = val_ssim_str = noisy_psnr_str = noisy_ssim_str = ''
+            is_best = False
+
+            if (epoch % num_freq_disp == 0) or (epoch == num_epoch):
                 netG.eval()
+                psnr_list, ssim_list = [], []
+                noisy_psnr_list, noisy_ssim_list = [], []
 
-                loss_G_val = []
+                with torch.no_grad():
+                    for i, data in enumerate(loader_val):
+                        inp = data['input'].to(device)
+                        gt_np = data['label'][0].numpy()
+                        wb_np = data['wb'][0].numpy()
+                        fname = data['name'][0]
 
-                for batch, data in enumerate(loader_val, 1):
-                    def should(freq):
-                        return freq > 0 and (batch % freq == 0 or batch == num_batch_val)
+                        output = infer_full_image(netG, inp)
+                        output = torch.clamp(output, 0.0, 1.0)
 
-                    # input = data['input'].to(device)
-                    input = data['label'].to(device)
-                    label = data['label'].to(device)
-                    mask = data['mask'].to(device)
+                        pred_np = output[0].cpu().numpy()
+                        noisy_np = np.clip(data['input'][0].numpy(), 0.0, 1.0)
 
-                    # forward netG
-                    output = netG(input)
+                        psnr_list.append(peak_signal_noise_ratio(gt_np, pred_np, data_range=1.0))
+                        ssim_list.append(structural_similarity(gt_np, pred_np, data_range=1.0, channel_axis=0))
+                        noisy_psnr_list.append(peak_signal_noise_ratio(gt_np, noisy_np, data_range=1.0))
+                        noisy_ssim_list.append(structural_similarity(gt_np, noisy_np, data_range=1.0, channel_axis=0))
 
-                    loss_G = fn_REG(output * (1 - mask), label * (1 - mask))
+                        if i < 3:
+                            clean_name = fname.replace('.ARW', '')
+                            out_path = os.path.join(preview_dir, f'ep{epoch:04d}_{i:02d}_{clean_name}.png')
+                            save_preview_png(noisy_np, pred_np, gt_np, wb_np, out_path)
 
-                    loss_G_val += [loss_G.item()]
+                val_psnr = float(np.mean(psnr_list))
+                val_ssim = float(np.mean(ssim_list))
+                noisy_psnr = float(np.mean(noisy_psnr_list))
+                noisy_ssim = float(np.mean(noisy_ssim_list))
 
-                    print('VALID: EPOCH %d: BATCH %04d/%04d: LOSS: %.4f'
-                          % (epoch, batch, num_batch_val, np.mean(loss_G_val)))
+                writer_val.add_scalar('psnr', val_psnr, epoch)
+                writer_val.add_scalar('ssim', val_ssim, epoch)
 
-                    if should(num_freq_disp):
-                        ## show output
-                        input = transform_inv(input)
-                        label = transform_inv(label)
-                        output = transform_inv(output)
+                val_psnr_str = f'{val_psnr:.4f}'
+                val_ssim_str = f'{val_ssim:.6f}'
+                noisy_psnr_str = f'{noisy_psnr:.4f}'
+                noisy_ssim_str = f'{noisy_ssim:.6f}'
 
-                        input = np.clip(input, 0, 1)
-                        label = np.clip(label, 0, 1)
-                        output = np.clip(output, 0, 1)
-                        dif = np.clip(abs(label - input), 0, 1)
+                if val_psnr > best_psnr:
+                    best_psnr = val_psnr
+                    is_best = True
 
-                        writer_val.add_images('input', input, num_batch_val * (epoch - 1) + batch, dataformats='NHWC')
-                        writer_val.add_images('output', output, num_batch_val * (epoch - 1) + batch, dataformats='NHWC')
-                        writer_val.add_images('label', label, num_batch_val * (epoch - 1) + batch, dataformats='NHWC')
+                print(f'VALID: EPOCH {epoch:04d} | PSNR: {val_psnr:.2f} dB (Noisy: {noisy_psnr:.2f}, '
+                      f'+{val_psnr - noisy_psnr:.2f} dB) | SSIM: {val_ssim:.4f} (Noisy: {noisy_ssim:.4f}) '
+                      f'| Best: {best_psnr:.2f} dB')
 
-                        for j in range(label.shape[0]):
-                            # name = num_train * (epoch - 1) + num_batch_train * (batch - 1) + j
-                            name = num_batch_train * (batch - 1) + j
-                            fileset = {'name': name,
-                                       'input': "%04d-input.png" % name,
-                                       'output': "%04d-output.png" % name,
-                                       'label': "%04d-label.png" % name,
-                                       'dif': "%04d-dif.png" % name, }
-
-                            plt.imsave(os.path.join(dir_result_val, 'images', fileset['input']), input[j, :, :, :].squeeze(), cmap=cmap)
-                            plt.imsave(os.path.join(dir_result_val, 'images', fileset['output']), output[j, :, :, :].squeeze(), cmap=cmap)
-                            plt.imsave(os.path.join(dir_result_val, 'images', fileset['label']), label[j, :, :, :].squeeze(), cmap=cmap)
-                            plt.imsave(os.path.join(dir_result_val, 'images', fileset['dif']), dif[j, :, :, :].squeeze(), cmap=cmap)
-
-                            append_index(dir_result_val, fileset)
-
-                writer_val.add_scalar('loss_G', np.mean(loss_G_val), epoch)
-
-            # update schduler
-            # schedG.step()
-            # schedD.step()
+            elapsed = time.time() - t0
+            with open(csv_path, 'a', newline='') as f:
+                csv.writer(f).writerow([
+                    epoch, f'{avg_train_loss:.6f}', val_psnr_str, val_ssim_str,
+                    noisy_psnr_str, noisy_ssim_str, f'{elapsed:.1f}'
+                ])
 
             ## save
-            if (epoch % num_freq_save) == 0:
-                self.save(dir_chck, netG, optimG, epoch)
+            if (epoch % num_freq_save == 0) or is_best or (epoch == num_epoch):
+                self.save(dir_chck, netG, optimG, epoch, best_psnr=best_psnr, is_best=is_best)
+            else:
+                torch.save({
+                    'netG': netG.state_dict(),
+                    'optimG': optimG.state_dict(),
+                    'epoch': epoch,
+                    'best_psnr': best_psnr
+                }, os.path.join(dir_chck, 'model_latest.pth'))
 
         writer_train.close()
         writer_val.close()
 
     def test(self):
         mode = self.mode
-
-        batch_size = self.batch_size
         device = self.device
         gpu_ids = self.gpu_ids
 
         nch_in = self.nch_in
         nch_out = self.nch_out
         nch_ker = self.nch_ker
-
-        size_data = (self.ny_in, self.nx_in, self.nch_in)
-        size_window = (5, 5)
-
-
         norm = self.norm
-
         name_data = self.name_data
 
-        if nch_out == 1:
-            cmap = 'gray'
-        else:
-            cmap = None
-
-        ## setup dataset
+        ## setup directories & dataset
         dir_chck = os.path.join(self.dir_checkpoint, self.scope, name_data)
-
         dir_result_test = os.path.join(self.dir_result, self.scope, name_data, 'test')
-        if not os.path.exists(os.path.join(dir_result_test, 'images')):
-            os.makedirs(os.path.join(dir_result_test, 'images'))
+        preview_dir = os.path.join(dir_result_test, 'previews')
+        os.makedirs(preview_dir, exist_ok=True)
 
-        dir_data_test = os.path.join(self.dir_data, name_data, 'test')
-
-        transform_test = transforms.Compose([Normalize(mean=0.5, std=0.5), ToTensor()])
-        transform_inv = transforms.Compose([ToNumpy(), Denormalize(mean=0.5, std=0.5)])
-        transform_ts2np = ToNumpy()
-
-        # dataset_test = Dataset(dir_data_test, data_type=self.data_type, transform=transform_test, sgm=(0, 25))
-        dataset_test = Dataset(dir_data_test, data_type=self.data_type, transform=transform_test, sgm=25, ratio=1, size_data=size_data, size_window=size_window)
-        loader_test = torch.utils.data.DataLoader(dataset_test, batch_size=batch_size, shuffle=False, num_workers=8)
-
-        num_test = len(dataset_test)
-
-        num_batch_test = int((num_test / batch_size) + ((num_test % batch_size) != 0))
+        test_list = os.path.join(self.dir_list, 'Sony_test_list.txt')
+        transform_test = transforms.Compose([ToTensor()])
+        dataset_test = Dataset(self.dir_data, test_list, mode='test', transform=transform_test)
+        loader_test = torch.utils.data.DataLoader(
+            dataset_test, batch_size=1, shuffle=False, num_workers=self.num_workers
+        )
 
         ## setup network
-        # netG = UNet(nch_in, nch_out, nch_ker, norm)
-        netG = ResNet(nch_in, nch_out, nch_ker, norm)
-        init_net(netG, init_type='normal', init_gain=0.02, gpu_ids=gpu_ids)
+        if self.network == 'resnet':
+            netG = ResNet(nch_in, nch_out, nch_ker, norm)
+        else:
+            netG = UNet(nch_in, nch_out, nch_ker, norm)
 
-        ## setup loss & optimization
-        fn_REG = nn.L1Loss().to(device)  # L1
-        # fn_REG = nn.MSELoss().to(device)  # L1
+        netG = init_net(netG, init_type='normal', init_gain=0.02, gpu_ids=gpu_ids)
+        netG.to(device)
 
-        ## load from checkpoints
-        st_epoch = 0
-
+        ## load best checkpoint
         netG, st_epoch = self.load(dir_chck, netG, mode=mode)
 
         ## test phase
+        netG.eval()
+        psnr_list, ssim_list = [], []
+        noisy_psnr_list, noisy_ssim_list = [], []
+
+        print(f'TEST: Valutazione su {len(dataset_test)} immagini (checkpoint epoca {st_epoch})...')
         with torch.no_grad():
-            netG.eval()
-            # netG.train()
+            for i, data in enumerate(loader_test):
+                inp = data['input'].to(device)
+                gt_np = data['label'][0].numpy()
+                wb_np = data['wb'][0].numpy()
+                fname = data['name'][0]
 
-            loss_G_test = []
+                output = infer_full_image(netG, inp)
+                output = torch.clamp(output, 0.0, 1.0)
 
-            for i, data in enumerate(loader_test, 1):
-                # input = data['input'].to(device)
-                input = data['label'].to(device)
-                label = data['label'].to(device)
-                mask = data['mask'].to(device)
+                pred_np = output[0].cpu().numpy()
+                noisy_np = np.clip(data['input'][0].numpy(), 0.0, 1.0)
 
-                output = netG(input)
+                psnr_list.append(peak_signal_noise_ratio(gt_np, pred_np, data_range=1.0))
+                ssim_list.append(structural_similarity(gt_np, pred_np, data_range=1.0, channel_axis=0))
+                noisy_psnr_list.append(peak_signal_noise_ratio(gt_np, noisy_np, data_range=1.0))
+                noisy_ssim_list.append(structural_similarity(gt_np, noisy_np, data_range=1.0, channel_axis=0))
 
-                loss_G = fn_REG(output * (1 - mask), label * (1 - mask))
+                if i < 10:
+                    clean_name = fname.replace('.ARW', '')
+                    out_path = os.path.join(preview_dir, f'TEST_{i:02d}_{clean_name}.png')
+                    save_preview_png(noisy_np, pred_np, gt_np, wb_np, out_path)
 
-                loss_G_test += [loss_G.item()]
+                if (i + 1) % 50 == 0 or (i + 1) == len(dataset_test):
+                    print(f'TEST: {i + 1}/{len(dataset_test)} | PSNR parziale: {np.mean(psnr_list):.2f} dB')
 
-                input = transform_inv(input)
-                label = transform_inv(label)
-                output = transform_inv(output)
+        test_psnr = float(np.mean(psnr_list))
+        test_ssim = float(np.mean(ssim_list))
+        noisy_psnr = float(np.mean(noisy_psnr_list))
+        noisy_ssim = float(np.mean(noisy_ssim_list))
 
-                input = np.clip(input, 0, 1)
-                label = np.clip(label, 0, 1)
-                output = np.clip(output, 0, 1)
-                dif = np.clip(abs(label - input), 0, 1)
+        print(f'TEST BASELINE NOISY -> PSNR: {noisy_psnr:.2f} dB | SSIM: {noisy_ssim:.4f}')
+        print(f'TEST DENOISED N2V   -> PSNR: {test_psnr:.2f} dB (+{test_psnr - noisy_psnr:.2f} dB) '
+              f'| SSIM: {test_ssim:.4f} (+{test_ssim - noisy_ssim:.4f})')
 
-                for j in range(label.shape[0]):
-                    name = batch_size * (i - 1) + j
-                    fileset = {'name': name,
-                               'input': "%04d-input.png" % name,
-                               'output': "%04d-output.png" % name,
-                               'label': "%04d-label.png" % name,
-                               'dif': "%04d-dif.png" % name,}
-
-                    plt.imsave(os.path.join(dir_result_test, 'images', fileset['input']), input[j, :, :, :].squeeze(), cmap=cmap)
-                    plt.imsave(os.path.join(dir_result_test, 'images', fileset['output']), output[j, :, :, :].squeeze(), cmap=cmap)
-                    plt.imsave(os.path.join(dir_result_test, 'images', fileset['label']), label[j, :, :, :].squeeze(), cmap=cmap)
-                    plt.imsave(os.path.join(dir_result_test, 'images', fileset['dif']), dif[j, :, :, :].squeeze(), cmap=cmap)
-
-                    append_index(dir_result_test, fileset)
-
-                print('TEST: %d/%d: LOSS: %.6f' % (i, num_batch_test, loss_G.item()))
-            print('TEST: AVERAGE LOSS: %.6f' % (np.mean(loss_G_test)))
+        with open(os.path.join(dir_result_test, 'test_results.txt'), 'w') as f:
+            f.write(f'Checkpoint epoch: {st_epoch}\n')
+            f.write(f'Network: {self.network}\n')
+            f.write(f'Test images: {len(dataset_test)}\n')
+            f.write(f'Noisy Baseline PSNR: {noisy_psnr:.4f} dB | SSIM: {noisy_ssim:.6f}\n')
+            f.write(f'Denoised N2V   PSNR: {test_psnr:.4f} dB | SSIM: {test_ssim:.6f}\n')
+            f.write(f'Gain           PSNR: +{test_psnr - noisy_psnr:.4f} dB | SSIM: +{test_ssim - noisy_ssim:.6f}\n')
 
 
 def set_requires_grad(nets, requires_grad=False):

@@ -1,3 +1,4 @@
+import rawpy
 import numpy as np
 import torch
 import skimage
@@ -6,6 +7,42 @@ import matplotlib.pyplot as plt
 import os
 import copy
 
+def pack_raw(raw, clip_neg=True):
+    im = raw.raw_image_visible.astype(np.float32) - 512.0
+    if clip_neg:
+        im = np.maximum(im, 0.0)
+    im = im / (16383.0 - 512.0)
+    im = np.expand_dims(im, axis=2)
+    H, W, _ = im.shape
+
+    out = np.concatenate((
+        im[0:H:2, 0:W:2, :],  # R
+        im[0:H:2, 1:W:2, :],  # G1
+        im[1:H:2, 1:W:2, :],  # B
+        im[1:H:2, 0:W:2, :]   # G2
+    ), axis=2)
+    return out
+
+
+def get_exposure_time(filepath):
+    fn = os.path.basename(filepath)
+    return float(fn.split('_')[-1].lower().replace('s.arw', ''))
+
+
+def raw4_to_srgb(raw4, wb=None):
+    r = raw4[0]
+    g = 0.5 * (raw4[1] + raw4[3])
+    b = raw4[2]
+
+    if wb is not None and len(wb) >= 3 and wb[1] > 0:
+        r = r * (wb[0] / wb[1])
+        b = b * (wb[2] / wb[1])
+
+    rgb = np.stack([r, g, b], axis=-1)
+    rgb = np.clip(rgb, 0.0, 1.0)
+    rgb = np.power(rgb, 1.0 / 2.2)
+    return (rgb * 255.0).astype(np.uint8)
+
 
 class Dataset(torch.utils.data.Dataset):
     """
@@ -13,70 +50,62 @@ class Dataset(torch.utils.data.Dataset):
        stuff<number>_trans.pt
        stuff<number>_density.pt
     """
-
-    def __init__(self, data_dir, data_type='float32', transform=None, sgm=25, ratio=0.9, size_data=(256, 256, 3), size_window=(5, 5)):
+    def __init__(self, data_dir, list_file, mode='train', transform=None,
+                 patch_size=256, max_images=0, ratio=0.985, size_window=(5, 5)):
         self.data_dir = data_dir
+        self.mode = mode
         self.transform = transform
-        self.data_type = data_type
-        self.sgm = sgm
-
+        self.patch_size = patch_size
         self.ratio = ratio
-        self.size_data = size_data
         self.size_window = size_window
+        self.pairs = []
 
-        lst_data = os.listdir(data_dir)
+        with open(list_file, 'r') as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) >= 2:
+                    short_rel = parts[0][2:] if parts[0].startswith('./') else parts[0].lstrip('/')
+                    long_rel = parts[1][2:] if parts[1].startswith('./') else parts[1].lstrip('/')
+                    short_path = os.path.join(data_dir, short_rel)
+                    long_path = os.path.join(data_dir, long_rel)
+                    if os.path.exists(short_path) and os.path.exists(long_path):
+                        self.pairs.append((short_path, long_path))
 
-        # lst_input = [f for f in lst_data if f.startswith('input')]
-        # lst_label = [f for f in lst_data if f.startswith('label')]
-        #
-        # lst_input.sort(key=lambda f: int(''.join(filter(str.isdigit, f))))
-        # lst_label.sort(key=lambda f: int(''.join(filter(str.isdigit, f))))
-        #
-        # self.lst_input = lst_input
-        # self.lst_label = lst_label
+        if max_images > 0 and max_images < len(self.pairs):
+            indices = np.linspace(0, len(self.pairs) - 1, max_images, dtype=int)
+            self.pairs = [self.pairs[i] for i in indices]
 
-        lst_data.sort(key=lambda f: (''.join(filter(str.isdigit, f))))
-        # lst_data.sort(key=lambda f: int(''.join(filter(str.isdigit, f))))
-
-        self.lst_data = lst_data
-        self.noise = self.sgm / 255.0 * np.random.randn(len(self.lst_data), self.size_data[0], self.size_data[1], self.size_data[2])
-
+        if len(self.pairs) == 0:
+            raise RuntimeError(f"Nessun file .ARW trovato! Controlla data_dir={data_dir} e list_file={list_file}")
+            
     def __getitem__(self, index):
-        # label = np.load(os.path.join(self.data_dir, self.lst_label[index]))
-        # input = np.load(os.path.join(self.data_dir, self.lst_input[index]))
-        #
-        # if label.dtype == np.uint8:
-        #     label = label / 255.0
-        # if input.dtype == np.uint8:
-        #     input = input / 255.0
-        #
-        # if label.ndim == 2:
-        #     label = np.expand_dims(label, axis=2)
-        # if input.ndim == 2:
-        #     input = np.expand_dims(input, axis=2)
-        #
-        # if self.ny != label.shape[0]:
-        #     label = label.transpose((1, 0, 2))
-        # if self.ny != input.shape[0]:
-        #     input = input.transpose((1, 0, 2))
-        #
-        # data = {'input': input, 'label': label}
+        short_path, long_path = self.pairs[index]
+        ratio = min(get_exposure_time(long_path) / get_exposure_time(short_path), 300.0)
 
-        data = plt.imread(os.path.join(self.data_dir, self.lst_data[index]))
+        with rawpy.imread(short_path) as raw_in:
+            in_raw = np.clip(pack_raw(raw_in, clip_neg=False) * ratio, -1.0, 1.0)
 
-        if data.dtype == np.uint8:
-            data = data / 255.0
+        if self.mode == 'train':
+            H, W, _ = in_raw.shape
+            ps = self.patch_size
+            yy = np.random.randint(0, H - ps + 1)
+            xx = np.random.randint(0, W - ps + 1)
+            patch = in_raw[yy:yy + ps, xx:xx + ps, :]
 
-        if data.ndim == 2:
-            data = np.expand_dims(data, axis=2)
+            label = patch.copy()
+            inp, mask = self.generate_mask(patch)
+            data = {'label': label, 'input': inp, 'mask': mask}
+        else:
+            with rawpy.imread(long_path) as raw_gt:
+                gt_raw = np.clip(pack_raw(raw_gt, clip_neg=True), 0.0, 1.0)
+                wb = np.array(raw_gt.camera_whitebalance[:3], dtype=np.float32)
 
-        if data.shape[0] > data.shape[1]:
-            data = data.transpose((1, 0, 2))
-
-        label = data + self.noise[index]
-        input, mask = self.generate_mask(copy.deepcopy(label))
-
-        data = {'label': label, 'input': input, 'mask': mask}
+            data = {
+                'label': gt_raw,
+                'input': in_raw,
+                'wb': wb,
+                'name': os.path.basename(short_path)
+            }
 
         if self.transform:
             data = self.transform(data)
@@ -84,36 +113,36 @@ class Dataset(torch.utils.data.Dataset):
         return data
 
     def __len__(self):
-        return len(self.lst_data)
+        return len(self.pairs)
 
     def generate_mask(self, input):
-
         ratio = self.ratio
         size_window = self.size_window
-        size_data = self.size_data
-        num_sample = int(size_data[0] * size_data[1] * (1 - ratio))
+        H, W, C = input.shape
+        num_sample = int(H * W * (1 - ratio))
 
-        mask = np.ones(size_data)
-        output = input
+        mask = np.ones((H, W, C), dtype=np.float32)
+        output = input.copy()
 
-        for ich in range(size_data[2]):
-            idy_msk = np.random.randint(0, size_data[0], num_sample)
-            idx_msk = np.random.randint(0, size_data[1], num_sample)
+        idy_msk = np.random.randint(0, H, num_sample)
+        idx_msk = np.random.randint(0, W, num_sample)
 
-            idy_neigh = np.random.randint(-size_window[0] // 2 + size_window[0] % 2, size_window[0] // 2 + size_window[0] % 2, num_sample)
-            idx_neigh = np.random.randint(-size_window[1] // 2 + size_window[1] % 2, size_window[1] // 2 + size_window[1] % 2, num_sample)
+        half_y = size_window[0] // 2
+        half_x = size_window[1] // 2
+        idy_neigh = np.random.randint(-half_y, half_y + 1, num_sample)
+        idx_neigh = np.random.randint(-half_x, half_x + 1, num_sample)
 
-            idy_msk_neigh = idy_msk + idy_neigh
-            idx_msk_neigh = idx_msk + idx_neigh
+        same = (idy_neigh == 0) & (idx_neigh == 0)
+        while np.any(same):
+            idy_neigh[same] = np.random.randint(-half_y, half_y + 1, np.sum(same))
+            idx_neigh[same] = np.random.randint(-half_x, half_x + 1, np.sum(same))
+            same = (idy_neigh == 0) & (idx_neigh == 0)
 
-            idy_msk_neigh = idy_msk_neigh + (idy_msk_neigh < 0) * size_data[0] - (idy_msk_neigh >= size_data[0]) * size_data[0]
-            idx_msk_neigh = idx_msk_neigh + (idx_msk_neigh < 0) * size_data[1] - (idx_msk_neigh >= size_data[1]) * size_data[1]
+        idy_msk_neigh = (idy_msk + idy_neigh) % H
+        idx_msk_neigh = (idx_msk + idx_neigh) % W
 
-            id_msk = (idy_msk, idx_msk, ich)
-            id_msk_neigh = (idy_msk_neigh, idx_msk_neigh, ich)
-
-            output[id_msk] = input[id_msk_neigh]
-            mask[id_msk] = 0.0
+        output[idy_msk, idx_msk, :] = input[idy_msk_neigh, idx_msk_neigh, :]
+        mask[idy_msk, idx_msk, :] = 0.0
 
         return output, mask
 
@@ -121,21 +150,17 @@ class ToTensor(object):
     """Convert ndarrays in sample to Tensors."""
 
     def __call__(self, data):
-        # Swap color axis because numpy image: H x W x C
-        #                         torch image: C x H x W
-
-        # for key, value in data:
-        #     data[key] = torch.from_numpy(value.transpose((2, 0, 1)))
-        #
-        # return data
-
-        input, label, mask = data['input'], data['label'], data['mask']
-
-        input = input.transpose((2, 0, 1)).astype(np.float32)
-        label = label.transpose((2, 0, 1)).astype(np.float32)
-        mask = mask.transpose((2, 0, 1)).astype(np.float32)
-        return {'input': torch.from_numpy(input), 'label': torch.from_numpy(label), 'mask': torch.from_numpy(mask)}
-
+        out = {
+            'input': torch.from_numpy(np.ascontiguousarray(data['input'].transpose((2, 0, 1)).astype(np.float32))),
+            'label': torch.from_numpy(np.ascontiguousarray(data['label'].transpose((2, 0, 1)).astype(np.float32)))
+        }
+        if 'mask' in data:
+            out['mask'] = torch.from_numpy(np.ascontiguousarray(data['mask'].transpose((2, 0, 1)).astype(np.float32)))
+        if 'wb' in data:
+            out['wb'] = torch.from_numpy(data['wb'].astype(np.float32))
+        if 'name' in data:
+            out['name'] = data['name']
+        return out
 
 class Normalize(object):
     def __init__(self, mean=0.5, std=0.5):
